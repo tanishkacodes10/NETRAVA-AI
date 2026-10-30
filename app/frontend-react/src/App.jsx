@@ -1,4 +1,3 @@
-
 import { useEffect, useRef, useState, useCallback } from 'react'
 import Navbar from './Navbar'
 import { go } from './auth'
@@ -299,9 +298,13 @@ export default function App() {
   const category =
     sessionStorage.getItem('es_category') || 'college_computer_science'
 
-  const questions =
+  const [questions, setQuestions] = useState(
     QUESTION_BANK[category] || QUESTION_BANK.college_computer_science
-
+  )
+  const [sessionId, setSessionId] = useState('')
+  const sessionIdRef = useRef('')
+  const [backendError, setBackendError] = useState('')
+  const [backendResult, setBackendResult] = useState(null)
   const subjectName = SUBJECT_NAMES[category] || 'Computer Science'
 
   const [answers, setAnswers] = useState({})
@@ -322,6 +325,39 @@ export default function App() {
   // Initially suppress fullscreen warnings until the exam has started.
   const suppressFullscreenWarningRef = useRef(true)
   const submitTimerRef = useRef(null)
+  const submittingRef = useRef(false)
+  const API_BASE = ''
+
+  async function sendBackendEvent(message) {
+    const activeSessionId = sessionIdRef.current
+    if (!activeSessionId || submittedRef.current) return
+
+    const normalized = message.toLowerCase()
+    let type = 'WINDOW_BLUR'
+    if (normalized.includes('fullscreen')) type = 'FULLSCREEN_EXIT'
+    else if (normalized.includes('tab') || normalized.includes('switched')) type = 'TAB_SWITCH'
+    else if (normalized.includes('no face')) type = 'NO_FACE'
+    else if (normalized.includes('multiple face')) type = 'MULTIPLE_FACES'
+    else if (normalized.includes('camera')) type = 'CAMERA_OFF'
+
+    try {
+      const response = await fetch(`${API_BASE}/api/event`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: activeSessionId,
+          type,
+          timestamp: Date.now() / 1000,
+        }),
+      })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error || `Event API returned ${response.status}`)
+      }
+    } catch (error) {
+      console.error('Could not save proctoring event:', error)
+    }
+  }
 
   const addWarning = useCallback((message) => {
     if (!examStartedRef.current) return
@@ -335,6 +371,7 @@ export default function App() {
     setWarningCount(nextCount)
     setWarningMessage(message)
     setShowWarningPopup(true)
+    void sendBackendEvent(message)
 
     if (nextCount >= 3) {
       setWarningMessage(
@@ -343,54 +380,136 @@ export default function App() {
 
       submitTimerRef.current = setTimeout(() => {
         suppressFullscreenWarningRef.current = true
-        submittedRef.current = true
         setShowWarningPopup(false)
-        setSubmitted(true)
+        void submitExam()
       }, 1800)
     }
   }, [])
 
   async function startExam() {
     setFullscreenError('')
+    setBackendError('')
+    setBackendResult(null)
     suppressFullscreenWarningRef.current = true
 
     try {
       if (!document.fullscreenElement) {
         await document.documentElement.requestFullscreen()
       }
-
-      // Confirm fullscreen before enabling any exam monitoring.
       if (!document.fullscreenElement) {
         throw new Error('Fullscreen was not activated.')
       }
+
+      const response = await fetch(`${API_BASE}/api/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          category,
+          name:
+            sessionStorage.getItem('es_name') ||
+            sessionStorage.getItem('es_user') ||
+            'Student',
+        }),
+      })
+      const data = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        throw new Error(data.error || `Backend returned ${response.status}`)
+      }
+      if (
+        !data.session_id ||
+        !Array.isArray(data.questions) ||
+        data.questions.length === 0
+      ) {
+        throw new Error('Backend returned an invalid exam session.')
+      }
+
+      sessionIdRef.current = data.session_id
+      setSessionId(data.session_id)
+      setQuestions(
+        data.questions.map((question) => ({
+          ...question,
+          answer: undefined,
+        }))
+      )
+      setAnswers({})
+      setTimeLeft(Number(data.duration_sec) || 600)
+      warningCountRef.current = 0
+      setWarningCount(0)
 
       suppressFullscreenWarningRef.current = false
       examStartedRef.current = true
       setExamStarted(true)
     } catch (error) {
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {})
+      }
       examStartedRef.current = false
       suppressFullscreenWarningRef.current = true
-
       setFullscreenError(
-        'Fullscreen could not start. Please click the button and try again.'
+        error.message === 'Fullscreen was not activated.'
+          ? 'Fullscreen could not start. Please click the button and try again.'
+          : `Could not start exam: ${error.message}. Check that Flask is running on port 5000 and the selected category exists.`
       )
-
-      console.error('Fullscreen error:', error)
+      console.error('Exam start error:', error)
     }
   }
 
-  function submitExam() {
+  async function submitExam() {
+    if (submittingRef.current || submittedRef.current) return
+    submittingRef.current = true
+
     if (submitTimerRef.current) {
       clearTimeout(submitTimerRef.current)
     }
 
-    // Prevent fullscreen-exit warning when submission exits fullscreen.
     suppressFullscreenWarningRef.current = true
-    submittedRef.current = true
-
     setShowConfirmation(false)
     setShowWarningPopup(false)
-    setSubmitted(true)
+    setBackendError('')
+
+    try {
+      const activeSessionId = sessionIdRef.current
+      if (!activeSessionId) {
+        throw new Error('No active backend session. Please restart the exam.')
+      }
+
+      const backendAnswers = {}
+      questions.forEach((question, index) => {
+        if (answers[index] !== undefined && question.id !== undefined) {
+          backendAnswers[String(question.id)] = answers[index]
+        }
+      })
+
+      const response = await fetch(`${API_BASE}/api/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: activeSessionId,
+          answers: backendAnswers,
+        }),
+      })
+      const result = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        throw new Error(result.error || `Submit API returned ${response.status}`)
+      }
+
+      setBackendResult({
+        score: Number(result.score) || 0,
+        total: Number(result.total) || questions.length,
+        warnings: Number(result.warnings) || warningCountRef.current,
+      })
+      submittedRef.current = true
+      setSubmitted(true)
+    } catch (error) {
+      console.error('Could not submit exam to backend:', error)
+      setBackendError(
+        `Result could not be saved: ${error.message}. Please check Flask and try submitting again.`
+      )
+      submittingRef.current = false
+      setShowConfirmation(true)
+    }
   }
 
   // Keep the refs in sync with React state.
@@ -496,11 +615,14 @@ export default function App() {
   const answeredCount = Object.keys(answers).length
   const progress = (answeredCount / questions.length) * 100
 
-  const score = questions.reduce(
+  const localScore = questions.reduce(
     (total, question, index) =>
-      total + (answers[index] === question.answer ? 1 : 0),
+      total +
+      (question.answer !== undefined && answers[index] === question.answer ? 1 : 0),
     0
   )
+  const score = backendResult ? backendResult.score : localScore
+  const resultTotal = backendResult ? backendResult.total : questions.length
 
   function formatTime(seconds) {
     const minutes = Math.floor(seconds / 60)
@@ -524,8 +646,8 @@ export default function App() {
 
             <div className="exam-score">
               <span>Your score</span>
-              <strong>{score} / {questions.length}</strong>
-              <p>{Math.round((score / questions.length) * 100)}% correct</p>
+              <strong>{score} / {resultTotal}</strong>
+              <p>{Math.round((score / Math.max(resultTotal, 1)) * 100)}% correct</p>
             </div>
 
             <p>Questions answered: {answeredCount} / {questions.length}</p>
@@ -574,9 +696,9 @@ export default function App() {
               </div>
             </div>
 
-            {fullscreenError && (
+            {(fullscreenError || backendError) && (
               <p className="auth-error" role="alert">
-                {fullscreenError}
+                {fullscreenError || backendError}
               </p>
             )}
 
@@ -729,6 +851,10 @@ export default function App() {
             aria-labelledby="confirm-title"
           >
             <h2 id="confirm-title">Submit assessment?</h2>
+
+            {backendError && (
+              <p className="auth-error" role="alert">{backendError}</p>
+            )}
 
             <p>
               You have answered {answeredCount} out of {questions.length} questions.

@@ -1,4 +1,3 @@
-
 import { useState } from 'react';
 import { signup, login, go } from './auth';
 
@@ -94,8 +93,8 @@ export default function Auth({ mode = 'login' }) {
     <main className="auth-page">
       <section className="auth-card">
         <div className="auth-brand">
-          <span className="auth-logo">ES</span>
-          <span>Exam Shield AI</span>
+          <span className="auth-logo">N</span>
+          <span>Netrava</span>
         </div>
 
         <h1>{isSignup ? 'Create your account' : 'Welcome back'}</h1>
